@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -297,9 +298,23 @@ class KimiLiteLLMConfig:
         self._client: Optional[httpx.AsyncClient] = None
     
     async def _get_client(self) -> httpx.AsyncClient:
-        """HTTPクライアントを取得"""
+        """HTTPクライアントを取得（詳細なタイムアウト設定）"""
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=60.0)
+            # 環境変数からタイムアウト設定を取得
+            timeout_connect = float(os.getenv("KIMI_TIMEOUT_CONNECT", "10.0"))
+            timeout_read = float(os.getenv("KIMI_TIMEOUT_READ", "600.0"))
+            timeout_write = float(os.getenv("KIMI_TIMEOUT_WRITE", "10.0"))
+            timeout_pool = float(os.getenv("KIMI_TIMEOUT_POOL", "10.0"))
+            
+            timeout = httpx.Timeout(
+                connect=timeout_connect,
+                read=timeout_read,
+                write=timeout_write,
+                pool=timeout_pool
+            )
+            
+            logger.info(f"Initializing HTTP client with timeout: connect={timeout_connect}s, read={timeout_read}s, write={timeout_write}s, pool={timeout_pool}s")
+            self._client = httpx.AsyncClient(timeout=timeout)
         return self._client
     
     async def completion(self, **kwargs) -> Any:
@@ -307,6 +322,7 @@ class KimiLiteLLMConfig:
         Kimi API呼び出し（直接OpenAI互換API使用）
         
         LiteLLMをバイパスして直接Kimi APIを呼び出す
+        エクスポネンシャルバックオフ付きリトライロジック実装
         """
         model = kwargs.get("model", "")
         
@@ -353,96 +369,152 @@ class KimiLiteLLMConfig:
             headers["Authorization"] = f"Bearer {access_token}"
             headers["Content-Type"] = "application/json"
             
-            # APIリクエスト
+            # リトライ設定を環境変数から取得
+            max_retries = int(os.getenv("KIMI_TIMEOUT_RETRY_MAX", "2"))
+            retry_delay = float(os.getenv("KIMI_TIMEOUT_RETRY_DELAY", "5.0"))
+            
+            # APIリクエスト（リトライロジック付き）
             client = await self._get_client()
-            try:
-                response = await client.post(
-                    f"{self.kimi_auth.api_base_url}/chat/completions",
-                    json=request_data,
-                    headers=headers,
-                )
-                
-                # デバッグ: レスポンスステータスとボディを確認
-                logger.info(f"Kimi API response status: {response.status_code}")
-                logger.debug(f"Response headers: {dict(response.headers)}")
-                logger.debug(f"Response text (first 500 chars): {response.text[:500]}")
-                
-                response.raise_for_status()
-                
-                # JSONパース前にテキストを確認
-                if not response.text:
-                    raise ValueError("Empty response from Kimi API")
+            last_exception = None
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    request_start_time = time.time()
                     
-                result = response.json()
-                
-                logger.info(f"Kimi API success: id={result.get('id')}, finish_reason={result.get('choices', [{}])[0].get('finish_reason')}")
-                
-                # tool_callsをチェック
-                if result.get('choices') and result['choices'][0].get('message', {}).get('tool_calls'):
-                    logger.info(f"Received {len(result['choices'][0]['message']['tool_calls'])} tool calls from Kimi")
-                
-                # 非ストリーミングの場合、SimpleNamespaceでラップ
-                # 現在は強制的に非ストリーミングモード
-                from types import SimpleNamespace
-                
-                # usage情報を構築
-                usage_data = result.get("usage", {})
-                usage = SimpleNamespace(**usage_data) if usage_data else None
-                
-                # choicesを構築
-                choices = []
-                for choice_data in result.get("choices", []):
-                    message_data = choice_data.get("message", {})
-                    
-                    # tool_callsを変換
-                    tool_calls = None
-                    if "tool_calls" in message_data and message_data["tool_calls"]:
-                        tool_calls = []
-                        for tc in message_data["tool_calls"]:
-                            function_data = tc.get("function", {})
-                            function = SimpleNamespace(
-                                name=function_data.get("name"),
-                                arguments=function_data.get("arguments", "{}")
-                            )
-                            tool_call = SimpleNamespace(
-                                id=tc.get("id"),
-                                type=tc.get("type", "function"),
-                                function=function
-                            )
-                            tool_calls.append(tool_call)
-                    
-                    # messageを構築
-                    message = SimpleNamespace(
-                        role=message_data.get("role", "assistant"),
-                        content=message_data.get("content"),
-                        tool_calls=tool_calls
+                    response = await client.post(
+                        f"{self.kimi_auth.api_base_url}/chat/completions",
+                        json=request_data,
+                        headers=headers,
                     )
                     
-                    choice = SimpleNamespace(
-                        message=message,
-                        finish_reason=choice_data.get("finish_reason"),
-                        index=choice_data.get("index", 0)
-                    )
-                    choices.append(choice)
+                    request_duration = time.time() - request_start_time
+                    logger.info(f"Kimi API request completed in {request_duration:.2f}s")
                 
-                return SimpleNamespace(
-                    id=result.get("id"),
-                    choices=choices,
-                    usage=usage,
-                    model=result.get("model"),
-                    created=result.get("created")
-                )
+                    # デバッグ: レスポンスステータスとボディを確認
+                    logger.info(f"Kimi API response status: {response.status_code}")
+                    logger.debug(f"Response headers: {dict(response.headers)}")
+                    logger.debug(f"Response text (first 500 chars): {response.text[:500]}")
                     
-            except httpx.HTTPStatusError as e:
-                logger.error(f"Kimi API HTTP error: {e.response.status_code} - {e.response.text}")
-                raise HTTPException(e.response.status_code, f"Kimi API error: {e.response.text}")
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse Kimi API response as JSON: {e}")
-                logger.error(f"Response status: {response.status_code}, text: {response.text}")
-                raise HTTPException(500, f"Invalid JSON response from Kimi API")
-            except Exception as e:
-                logger.error(f"Kimi API call failed: {e}", exc_info=True)
-                raise
+                    response.raise_for_status()
+                
+                    # JSONパース前にテキストを確認
+                    if not response.text:
+                        raise ValueError("Empty response from Kimi API")
+                        
+                    result = response.json()
+                    
+                    logger.info(f"Kimi API success: id={result.get('id')}, finish_reason={result.get('choices', [{}])[0].get('finish_reason')}")
+                    
+                    # tool_callsをチェック
+                    if result.get('choices') and result['choices'][0].get('message', {}).get('tool_calls'):
+                        logger.info(f"Received {len(result['choices'][0]['message']['tool_calls'])} tool calls from Kimi")
+                    
+                    # 非ストリーミングの場合、SimpleNamespaceでラップ
+                    # 現在は強制的に非ストリーミングモード
+                    from types import SimpleNamespace
+                    
+                    # usage情報を構築
+                    usage_data = result.get("usage", {})
+                    usage = SimpleNamespace(**usage_data) if usage_data else None
+                    
+                    # choicesを構築
+                    choices = []
+                    for choice_data in result.get("choices", []):
+                        message_data = choice_data.get("message", {})
+                        
+                        # tool_callsを変換
+                        tool_calls = None
+                        if "tool_calls" in message_data and message_data["tool_calls"]:
+                            tool_calls = []
+                            for tc in message_data["tool_calls"]:
+                                function_data = tc.get("function", {})
+                                function = SimpleNamespace(
+                                    name=function_data.get("name"),
+                                    arguments=function_data.get("arguments", "{}")
+                                )
+                                tool_call = SimpleNamespace(
+                                    id=tc.get("id"),
+                                    type=tc.get("type", "function"),
+                                    function=function
+                                )
+                                tool_calls.append(tool_call)
+                        
+                        # messageを構築
+                        message = SimpleNamespace(
+                            role=message_data.get("role", "assistant"),
+                            content=message_data.get("content"),
+                            tool_calls=tool_calls
+                        )
+                        
+                        choice = SimpleNamespace(
+                            message=message,
+                            finish_reason=choice_data.get("finish_reason"),
+                            index=choice_data.get("index", 0)
+                        )
+                        choices.append(choice)
+                    
+                    return SimpleNamespace(
+                        id=result.get("id"),
+                        choices=choices,
+                        usage=usage,
+                        model=result.get("model"),
+                        created=result.get("created")
+                    )
+                
+                except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.NetworkError) as e:
+                    last_exception = e
+                    request_duration = time.time() - request_start_time
+                    
+                    # タイムアウトの種類を判定
+                    timeout_type = "read" if isinstance(e, httpx.ReadTimeout) else "connect" if isinstance(e, httpx.ConnectTimeout) else "network"
+                    
+                    if attempt < max_retries:
+                        # リトライ実行
+                        wait_time = retry_delay * (2 ** attempt)
+                        logger.warning(
+                            f"Kimi API {timeout_type} timeout after {request_duration:.2f}s "
+                            f"(attempt {attempt + 1}/{max_retries + 1}). "
+                            f"Retrying in {wait_time:.1f}s... "
+                            f"Error: {e}"
+                        )
+                        await asyncio.sleep(wait_time)
+                        continue
+                    else:
+                        # 最大リトライ回数到達
+                        logger.error(
+                            f"Kimi API {timeout_type} timeout after {max_retries + 1} attempts. "
+                            f"Last attempt took {request_duration:.2f}s. "
+                            f"Messages: {len(request_data['messages'])}, Tools: {len(request_data.get('tools', []))}"
+                        )
+                        raise HTTPException(
+                            504,
+                            f"Kimi API {timeout_type} timeout after {max_retries + 1} attempts. "
+                            f"Please try simplifying your request or try again later."
+                        ) from e
+                    
+                except httpx.HTTPStatusError as e:
+                    # HTTP エラー（4xx, 5xx）はリトライしない
+                    logger.error(f"Kimi API HTTP error: {e.response.status_code} - {e.response.text}")
+                    raise HTTPException(e.response.status_code, f"Kimi API error: {e.response.text}")
+                except json.JSONDecodeError as e:
+                    # JSON パースエラーはリトライしない
+                    logger.error(f"Failed to parse Kimi API response as JSON: {e}")
+                    try:
+                        logger.error(f"Response status: {response.status_code}, text: {response.text}")
+                    except:
+                        pass
+                    raise HTTPException(500, f"Invalid JSON response from Kimi API")
+                except HTTPException:
+                    # すでにHTTPExceptionの場合は再スロー
+                    raise
+                except Exception as e:
+                    # その他の予期しないエラー
+                    logger.error(f"Kimi API call failed: {e}", exc_info=True)
+                    raise
+            
+            # ここに到達した場合、全てのリトライが失敗している
+            if last_exception:
+                raise last_exception
         else:
             # Kimi以外のモデルはLiteLLM使用
             logger.warning(f"Non-Kimi model {model}, falling back to LiteLLM")

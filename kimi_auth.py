@@ -82,7 +82,10 @@ class KimiAuth:
     async def _get_client(self) -> httpx.AsyncClient:
         """HTTPクライアントを取得（遅延初期化）"""
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=30.0)
+            # 環境変数からタイムアウト設定を取得（OAuth認証用）
+            auth_timeout = float(os.getenv("KIMI_AUTH_TIMEOUT", "30.0"))
+            logger.info(f"Initializing OAuth HTTP client with timeout: {auth_timeout}s")
+            self._client = httpx.AsyncClient(timeout=auth_timeout)
         return self._client
     
     def _get_or_create_device_id(self) -> str:
